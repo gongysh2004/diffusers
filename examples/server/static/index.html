@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stable Diffusion Streaming Demo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .input-group {
+            margin-bottom: 20px;
+        }
+        textarea {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            resize: vertical;
+            min-height: 100px;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        .progress-container {
+            margin-top: 20px;
+            text-align: center;
+        }
+        .progress-image {
+            max-width: 512px;
+            max-height: 512px;
+            margin: 10px auto;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        .final-image {
+            max-width: 512px;
+            max-height: 512px;
+            margin: 20px auto;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            display: none;
+        }
+        .status {
+            margin: 10px 0;
+            color: #666;
+        }
+        .error {
+            color: #ff0000;
+            margin: 10px 0;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Stable Diffusion Streaming Demo</h1>
+        <div class="input-group">
+            <textarea id="prompt" placeholder="Enter your prompt here..."></textarea>
+        </div>
+        <button id="generate" onclick="generateImage()">Generate Image</button>
+        <div class="error" id="error"></div>
+        <div class="progress-container">
+            <div class="status" id="status"></div>
+            <img id="progress-image" class="progress-image" style="display: none;">
+            <img id="final-image" class="final-image">
+        </div>
+    </div>
+
+    <script>
+        let imageChunksMap = new Map(); // Map to store chunks for each image
+        let expectedChunks = 0;
+        let messageBuffer = '';
+        let currentImageIndex = 0;
+
+        function generateImage() {
+            const prompt = document.getElementById('prompt').value.trim();
+            if (!prompt) {
+                showError('Please enter a prompt');
+                return;
+            }
+
+            // Reset UI
+            document.getElementById('error').style.display = 'none';
+            document.getElementById('progress-image').style.display = 'none';
+            document.getElementById('final-image').style.display = 'none';
+            document.getElementById('generate').disabled = true;
+            document.getElementById('status').textContent = 'Generating...';
+            imageChunksMap.clear();
+            expectedChunks = 0;
+            messageBuffer = '';
+            currentImageIndex = 0;
+            number_steps = 20;
+            fetch('/v1/images/generations', {
+                method: 'POST',
+                body: JSON.stringify({
+                    prompt: prompt,
+                    model: "stabilityai/stable-diffusion-3.5-large",
+                    n: number_steps
+                }),
+                headers: {
+                    'Content-Type': 'application/json'
+                }
+            }).then(response => {
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+
+                function readStream() {
+                    reader.read().then(({done, value}) => {
+                        if (done) {
+                            return;
+                        }
+                        
+                        const chunk = decoder.decode(value);
+                        messageBuffer += chunk;
+                        
+                        // Process complete messages
+                        const lines = messageBuffer.split('\n');
+                        messageBuffer = lines.pop() || ''; // Keep the last partial line in the buffer
+                        
+                        for (const line of lines) {
+                            if (line.trim() && line.startsWith('data: ')) {
+                                try {
+                                    const jsonStr = line.slice(6); // Remove 'data: ' prefix
+                                    const data = JSON.parse(jsonStr);
+                                    
+                                    if (data.status === 'complete') {
+                                        document.getElementById('status').textContent = 'Generation complete!';
+                                        document.getElementById('generate').disabled = false;
+                                    } else if (data.status === 'error') {
+                                        showError(data.message || 'An error occurred during generation');
+                                        document.getElementById('generate').disabled = false;
+                                    } else if (data.status === 'processing') {
+                                        const imageData = data.data[0];
+                                        if (imageData.chunk !== undefined) {
+                                            // Initialize array for this image if it doesn't exist
+                                            if (!imageChunksMap.has(currentImageIndex)) {
+                                                imageChunksMap.set(currentImageIndex, []);
+                                            }
+                                            
+                                            // Handle chunked image data
+                                            const currentImageChunks = imageChunksMap.get(currentImageIndex);
+                                            currentImageChunks[imageData.chunk] = imageData.image;
+                                            
+                                            // Update expected chunks from any chunk
+                                            if (imageData.total_chunks !== undefined) {
+                                                expectedChunks = imageData.total_chunks;
+                                            }
+                                            
+                                            // Update progress status
+                                            document.getElementById('status').textContent = `Processing: ${currentImageIndex + 1} / ${number_steps} (Step ${imageData.chunk + 1} / ${expectedChunks})`;
+                                            
+                                            // Check if we have all chunks for current image
+                                            if (currentImageChunks.length === expectedChunks && 
+                                                !currentImageChunks.includes(undefined)) {
+                                                const completeImage = currentImageChunks.join('');
+                                                document.getElementById('progress-image').src = `data:image/png;base64,${completeImage}`;
+                                                document.getElementById('progress-image').style.display = 'block';
+                                                currentImageIndex++; // Move to next image
+                                            }
+                                        }
+                                    }
+                                } catch (e) {
+                                    console.error('Error parsing JSON:', e, 'Line:', line);
+                                }
+                            }
+                        }
+                        
+                        readStream();
+                    }).catch(error => {
+                        showError('An error occurred during generation');
+                        document.getElementById('generate').disabled = false;
+                    });
+                }
+
+                readStream();
+            }).catch(error => {
+                showError('An error occurred during generation');
+                document.getElementById('generate').disabled = false;
+            });
+        }
+
+        function showError(message) {
+            const errorElement = document.getElementById('error');
+            errorElement.textContent = message;
+            errorElement.style.display = 'block';
+        }
+    </script>
+</body>
+</html> 
